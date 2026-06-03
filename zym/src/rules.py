@@ -6,7 +6,7 @@ from typing import Any
 
 import pandas as pd
 
-from .config import EXPIRY_LABELS, THRESHOLDS
+from .config import EXPIRY_LABELS, SALES_BASE_LABEL, THRESHOLDS
 from .matching import build_products, match_plan
 from .validation import clean_inventory, clean_plan, empty_issues, issues_frame
 
@@ -21,6 +21,10 @@ class AnalysisResult:
     quality_issues: pd.DataFrame
     counts: dict[str, int]
     plan_uploaded: bool
+
+
+def _sellable_periods(stock: float, sales: float) -> float:
+    return stock / sales
 
 
 def _expiry_category(expiry_date: pd.Timestamp, analysis_date: date) -> str | None:
@@ -69,6 +73,7 @@ def _calculate_expiry(
                         else ""
                     ),
                     "货架位置": batch["货架位置"],
+                    "仓库位置": batch.get("仓库位置", ""),
                     "批次库存": float(batch["批次库存"]),
                     "单位": product["单位"],
                     "到期日期": batch["到期日"].date(),
@@ -88,6 +93,7 @@ def _calculate_expiry(
             "进货日期",
             "保质期（天）",
             "货架位置",
+            "仓库位置",
             "批次库存",
             "单位",
             "到期日期",
@@ -123,30 +129,32 @@ def _inventory_risks(products: pd.DataFrame) -> pd.DataFrame:
     for _, product in products.iterrows():
         risk_types: list[str] = []
         reasons: list[str] = []
-        average: float | Any = pd.NA
-        days: float | str | Any = pd.NA
+        periods: float | str | Any = pd.NA
         can_calculate = (
             product["身份状态"] == "正常"
             and product["库存有效"]
-            and product["近7天销量有效"]
+            and product["本进货周期销量有效"]
             and product["单位有效"]
         )
         if can_calculate:
-            sales = float(product["近7天销量"])
-            stock = float(product["当前库存"])
-            average = sales / 7
+            sales = float(product["本进货周期销量"])
+            stock = float(product["库存剩余量"])
             if sales > 0:
-                days = stock / average
-                if days <= THRESHOLDS["快缺货可售天数"]:
+                periods = _sellable_periods(stock, sales)
+                if periods <= THRESHOLDS["快缺货可售周期数"]:
                     risk_types.append("快缺货")
-                    reasons.append(f"预计可售天数 {days:.1f} 天，不超过 3 天")
-                if days > THRESHOLDS["库存偏高可售天数"]:
+                    reasons.append(
+                        f"按{SALES_BASE_LABEL} {sales:g} 估算，预计可售 {periods:.1f} 个进货周期，不超过 1 个周期"
+                    )
+                if periods > THRESHOLDS["库存偏高可售周期数"]:
                     risk_types.append("库存偏高")
-                    reasons.append(f"预计可售天数 {days:.1f} 天，超过 30 天")
+                    reasons.append(
+                        f"按{SALES_BASE_LABEL} {sales:g} 估算，预计可售 {periods:.1f} 个进货周期，超过 4 个周期"
+                    )
             elif stock > 0:
-                days = "无法消化"
+                periods = "无法消化"
                 risk_types.append("疑似滞销")
-                reasons.append("近7天销量为 0 且仍有库存")
+                reasons.append(f"{SALES_BASE_LABEL}为 0 且仍有库存")
 
         if product["存在临期库存"]:
             risk_types.append("临期风险")
@@ -161,8 +169,8 @@ def _inventory_risks(products: pd.DataFrame) -> pd.DataFrame:
             row = product.to_dict()
             row.update(
                 {
-                    "近7日日均销量": average,
-                    "预计可售天数": days,
+                    "销量计算基准": "一次进货周期",
+                    "预计可售进货周期数": periods,
                     "风险类型": "、".join(risk_types),
                     "提示依据": "；".join(reasons),
                 }
@@ -191,7 +199,7 @@ def _plan_review(
         reasons: list[str] = []
         status = "可自查"
         post_stock: Any = pd.NA
-        post_days: Any = pd.NA
+        post_periods: Any = pd.NA
 
         if has_invalid_quantity or has_invalid_unit:
             status = "数据不足无法自查"
@@ -211,12 +219,15 @@ def _plan_review(
                 total_expiring = sum(float(product[f"{label}库存"]) for label in EXPIRY_LABELS)
                 reasons.append(f"现有临期库存合计 {total_expiring:g}，建议先核对批次处理")
             if not blockers:
-                post_stock = float(product["当前库存"]) + planned
-                if float(product["近7天销量"]) > 0:
-                    post_days = post_stock / (float(product["近7天销量"]) / 7)
-                    if post_days > THRESHOLDS["进货过量可售天数"]:
+                post_stock = float(product["库存剩余量"]) + planned
+                if float(product["本进货周期销量"]) > 0:
+                    post_periods = _sellable_periods(post_stock, float(product["本进货周期销量"]))
+                    if post_periods > THRESHOLDS["进货过量可售周期数"]:
                         risks.append("可能进货过量")
-                        reasons.append(f"进货后预计可售天数 {post_days:.1f} 天，超过 45 天")
+                        reasons.append(
+                            f"按{SALES_BASE_LABEL} {float(product['本进货周期销量']):g} 估算，"
+                            f"进货后预计可售 {post_periods:.1f} 个进货周期，超过 6 个周期"
+                        )
             else:
                 status = "数据不足无法自查"
                 risks.append("数据不足无法自查")
@@ -231,11 +242,13 @@ def _plan_review(
                 "条码": product["条码"],
                 "品类": product["品类"],
                 "单位": product["单位"],
-                "当前库存": product["当前库存"],
-                "近7天销量": product["近7天销量"],
+                "上次进货总量": product["上次进货总量"],
+                "库存剩余量": product["库存剩余量"],
+                "仓库位置": product.get("仓库位置", ""),
+                "本进货周期销量": product["本进货周期销量"],
                 "计划进货数量": planned,
                 "进货后库存": post_stock,
-                "进货后预计可售天数": post_days,
+                "进货后预计可售进货周期数": post_periods,
                 "匹配状态": "；".join(dict.fromkeys(group["匹配状态"])),
                 "录入换算说明": "；".join(
                     dict.fromkeys(
@@ -260,11 +273,13 @@ def _plan_review(
                 "条码": plan_row["条码"],
                 "品类": "",
                 "单位": plan_row["单位"],
-                "当前库存": pd.NA,
-                "近7天销量": pd.NA,
+                "上次进货总量": pd.NA,
+                "库存剩余量": pd.NA,
+                "仓库位置": "",
+                "本进货周期销量": pd.NA,
                 "计划进货数量": plan_row["_计划进货数量"],
                 "进货后库存": pd.NA,
-                "进货后预计可售天数": pd.NA,
+                "进货后预计可售进货周期数": pd.NA,
                 "匹配状态": plan_row["匹配状态"],
                 "录入换算说明": plan_row.get("录入换算说明", ""),
                 "自查状态": "待核对",
@@ -301,15 +316,17 @@ def _missed_orders(
             "商品名": product["商品名"],
             "条码": product["条码"],
             "品类": product["品类"],
-            "当前库存": product["当前库存"],
-            "近7天销量": product["近7天销量"],
-            "预计可售天数": product["预计可售天数"],
+            "上次进货总量": product["上次进货总量"],
+            "库存剩余量": product["库存剩余量"],
+            "仓库位置": product.get("仓库位置", ""),
+            "本进货周期销量": product["本进货周期销量"],
+            "预计可售进货周期数": product["预计可售进货周期数"],
             "货架位置": product["货架位置"],
             "判断状态": "待核对是否漏订" if uncertain else "可能漏订",
             "提示依据": (
                 "计划行存在数量或匹配问题，需先核对后确认是否漏订。"
                 if uncertain
-                else "预计可售天数不超过 3 天，且未匹配到正数计划进货量。"
+                else f"按{SALES_BASE_LABEL}估算，预计可售不超过 1 个进货周期，且未匹配到正数计划进货量。"
             ),
         }
         rows.append(row)

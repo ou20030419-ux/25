@@ -8,7 +8,7 @@ import pandas as pd
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-from .config import RULESET_VERSION, THRESHOLDS
+from .config import RULESET_VERSION, SALES_BASE_LABEL, THRESHOLDS
 from .rules import AnalysisResult
 
 
@@ -34,9 +34,11 @@ def build_export_workbook(
         ("库存销售表文件", input_files.get("inventory", "")),
         ("计划进货单文件", input_files.get("plan", "未上传")),
         ("计划进货分析状态", "已执行" if result.plan_uploaded else "尚未上传计划进货单，未执行该分析"),
-        ("快缺货阈值", f"预计可售天数 <= {THRESHOLDS['快缺货可售天数']} 天"),
-        ("库存偏高阈值", f"预计可售天数 > {THRESHOLDS['库存偏高可售天数']} 天"),
-        ("可能进货过量阈值", f"进货后预计可售天数 > {THRESHOLDS['进货过量可售天数']} 天"),
+        ("销量计算基准", f"按一次进货周期录入销量；库存风险按{SALES_BASE_LABEL}估算"),
+        ("库存剩余量算法", "优先使用手动填写的库存剩余量；未填写时按上次进货总量 - 本进货周期销量计算"),
+        ("快缺货阈值", f"预计可售进货周期数 <= {THRESHOLDS['快缺货可售周期数']}"),
+        ("库存偏高阈值", f"预计可售进货周期数 > {THRESHOLDS['库存偏高可售周期数']}"),
+        ("可能进货过量阈值", f"进货后预计可售进货周期数 > {THRESHOLDS['进货过量可售周期数']}"),
         ("临期口径", "优先采用标注到期日期，否则按进货日期加保质期估算；仅统计有效且仍有库存的批次"),
         ("使用说明", "风险提示用于补货前复核，不代表强制性进货决定。"),
     ]

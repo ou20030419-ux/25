@@ -2,11 +2,12 @@ from zoneinfo import ZoneInfo
 
 RULESET_VERSION = "MVP_RULESET_V2"
 STORE_TIMEZONE = ZoneInfo("Asia/Shanghai")
+SALES_BASE_LABEL = "本进货周期销量"
 
 THRESHOLDS = {
-    "快缺货可售天数": 3,
-    "库存偏高可售天数": 30,
-    "进货过量可售天数": 45,
+    "快缺货可售周期数": 1,
+    "库存偏高可售周期数": 4,
+    "进货过量可售周期数": 6,
     "7天内临期": 7,
     "30天内临期": 30,
 }
@@ -14,13 +15,15 @@ THRESHOLDS = {
 INVENTORY_COLUMNS = [
     "商品名",
     "进货日期",
-    "当前库存",
+    "上次进货总量",
+    "本进货周期销量",
+    "库存剩余量",
     "单位",
-    "近7天销量",
     "近30天销量",
     "保质期（天）",
     "标注到期日期",
     "货架位置",
+    "仓库位置",
     "条码",
     "品类",
 ]

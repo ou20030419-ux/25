@@ -127,11 +127,15 @@ def clean_inventory(frame: pd.DataFrame, issues: list[dict[str, Any]]) -> pd.Dat
     source_data = frame.copy()
     if "标注到期日期" not in source_data.columns and "到期日期" in source_data.columns:
         source_data["标注到期日期"] = source_data["到期日期"]
+    if "本进货周期销量" not in source_data.columns and "近7天销量" in source_data.columns:
+        source_data["本进货周期销量"] = source_data["近7天销量"]
+    if "库存剩余量" not in source_data.columns and "当前库存" in source_data.columns:
+        source_data["库存剩余量"] = source_data["当前库存"]
     received_columns = set(source_data.columns)
     data = _ensure_columns(
         source_data,
         INVENTORY_COLUMNS,
-        ["当前库存", "近7天销量"],
+        ["本进货周期销量"],
         source,
         issues,
         report_optional_missing=False,
@@ -170,7 +174,7 @@ def clean_inventory(frame: pd.DataFrame, issues: list[dict[str, Any]]) -> pd.Dat
                 "商品名与有效条码均为空，无法识别商品。",
             )
 
-    for column in ["当前库存", "近7天销量", "近30天销量"]:
+    for column in ["上次进货总量", "本进货周期销量", "库存剩余量", "近30天销量"]:
         parsed: list[float | None] = []
         valid: list[bool] = []
         if column not in received_columns:
@@ -178,6 +182,11 @@ def clean_inventory(frame: pd.DataFrame, issues: list[dict[str, Any]]) -> pd.Dat
             data[f"_{column}有效"] = [False] * len(data)
             continue
         for _, row in data.iterrows():
+            blocking = column in {"本进货周期销量"}
+            if not blocking and not display_value(row[column]):
+                parsed.append(None)
+                valid.append(False)
+                continue
             number, ok = _parse_number(
                 row[column],
                 column,
@@ -186,12 +195,59 @@ def clean_inventory(frame: pd.DataFrame, issues: list[dict[str, Any]]) -> pd.Dat
                 row["商品名"],
                 row["条码"],
                 issues,
-                column in {"当前库存", "近7天销量"},
+                blocking,
             )
             parsed.append(number)
             valid.append(ok)
         data[f"_{column}"] = parsed
         data[f"_{column}有效"] = valid
+
+    stock_values: list[float | None] = []
+    stock_valid: list[bool] = []
+    stock_sources: list[str] = []
+    for index, row in data.iterrows():
+        if row["_库存剩余量有效"]:
+            stock_values.append(float(row["_库存剩余量"]))
+            stock_valid.append(True)
+            stock_sources.append("手动填写库存剩余量")
+            continue
+        if row["_上次进货总量有效"] and row["_本进货周期销量有效"]:
+            remaining = float(row["_上次进货总量"]) - float(row["_本进货周期销量"])
+            if remaining < 0:
+                add_issue(
+                    issues,
+                    "库存剩余量异常",
+                    source,
+                    int(row["_原始行号"]),
+                    row["商品名"],
+                    row["条码"],
+                    "本进货周期销量大于上次进货总量，库存剩余量按 0 参与分析；请核对是否存在上期库存或录入错误。",
+                    False,
+                )
+                remaining = 0.0
+            stock_values.append(remaining)
+            stock_valid.append(True)
+            stock_sources.append("按上次进货总量-本进货周期销量计算")
+            data.at[index, "库存剩余量"] = remaining
+            continue
+        stock_values.append(None)
+        stock_valid.append(False)
+        stock_sources.append("")
+        add_issue(
+            issues,
+            "库存剩余量缺失",
+            source,
+            int(row["_原始行号"]),
+            row["商品名"],
+            row["条码"],
+            "请填写库存剩余量，或同时填写上次进货总量和本进货周期销量以便系统自动计算。",
+        )
+    data["_库存剩余量"] = stock_values
+    data["_库存剩余量有效"] = stock_valid
+    data["_库存剩余量来源"] = stock_sources
+    data["_当前库存"] = data["_库存剩余量"]
+    data["_当前库存有效"] = data["_库存剩余量有效"]
+    data["当前库存"] = data["库存剩余量"]
 
     parsed_arrivals = pd.to_datetime(data["进货日期"], errors="coerce")
     data["_进货日期"] = parsed_arrivals

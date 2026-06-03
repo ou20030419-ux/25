@@ -13,26 +13,30 @@ class DirectEntryUnitTests(unittest.TestCase):
     def test_inventory_entry_places_unit_and_expiry_fields_with_core_quantities(self):
         draft = inventory_editor_frame(template_frame("inventory").head(0))
         self.assertEqual(
-            list(draft.columns[:8]),
+            list(draft.columns[:6]),
             [
                 "商品名",
                 "进货日期",
-                "当前库存",
+                "上次进货总量",
+                "本进货周期销量",
+                "库存剩余量",
                 "单位",
-                "近7天销量",
-                "近30天销量",
-                "保质期（天）",
-                "标注到期日期",
             ],
         )
+        self.assertNotIn("自定义单位", draft.columns)
 
-    def test_custom_inventory_unit_is_kept_for_analysis(self):
+    def test_inventory_unit_accepts_free_text_for_analysis(self):
         inventory = template_frame("inventory", True).head(1)
         draft = inventory_editor_frame(inventory)
-        draft.loc[0, "单位"] = "其他（手动填写）"
-        draft.loc[0, "自定义单位"] = "礼盒"
+        draft.loc[0, "单位"] = "礼盒"
         submitted = submitted_inventory(draft)
         self.assertEqual(submitted.iloc[0]["单位"], "礼盒")
+
+    def test_existing_free_text_unit_reopens_in_single_unit_column(self):
+        inventory = template_frame("inventory", True).head(1).copy()
+        inventory.loc[0, "单位"] = "斤"
+        draft = inventory_editor_frame(inventory)
+        self.assertEqual(draft.loc[0, "单位"], "斤")
 
     def test_blank_rows_with_unit_prompt_are_not_submitted(self):
         draft = inventory_editor_frame(blank_entry_frame(INVENTORY_COLUMNS, 3))
@@ -40,7 +44,7 @@ class DirectEntryUnitTests(unittest.TestCase):
 
     def test_box_order_is_converted_to_inventory_unit(self):
         plan_input = pd.DataFrame(
-            [["海盐薯片 60g", "6900000000012", 2, "箱", "", 24, "袋", "", "周末陈列"]],
+            [["海盐薯片 60g", "6900000000012", 2, "箱", 24, "袋", "周末陈列"]],
             columns=DIRECT_PLAN_COLUMNS,
         )
         plan = submitted_plan(plan_input)
@@ -55,7 +59,7 @@ class DirectEntryUnitTests(unittest.TestCase):
 
     def test_cross_unit_order_without_factor_is_blocked(self):
         plan_input = pd.DataFrame(
-            [["海盐薯片 60g", "6900000000012", 2, "箱", "", "", "袋", "", ""]],
+            [["海盐薯片 60g", "6900000000012", 2, "箱", "", "袋", ""]],
             columns=DIRECT_PLAN_COLUMNS,
         )
         plan = submitted_plan(plan_input)

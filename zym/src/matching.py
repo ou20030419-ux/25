@@ -80,7 +80,7 @@ def build_products(
                     int(row["_原始行号"]),
                     row["商品名"],
                     row["条码"],
-                    "请为当前库存与销量选择统一单位后重新分析。",
+                    "请为库存剩余量与销量选择统一单位后重新分析。",
                 )
         elif not unit_ok:
             for _, row in group.iterrows():
@@ -93,12 +93,14 @@ def build_products(
                     row["条码"],
                     "同一商品存在多个单位，未提供换算关系前不进行数量分析。",
                 )
-        stock_ok = bool(group["_当前库存有效"].all()) and unit_ok and identity_ok
-        stock = group["_当前库存"].sum() if stock_ok else pd.NA
+        stock_ok = bool(group["_库存剩余量有效"].all()) and unit_ok and identity_ok
+        stock = group["_库存剩余量"].sum() if stock_ok else pd.NA
+        purchase_total_ok = bool(group["_上次进货总量有效"].all()) and unit_ok and identity_ok
+        purchase_total = group["_上次进货总量"].sum() if purchase_total_ok else pd.NA
 
         sales_values: dict[str, Any] = {}
         sales_ok: dict[str, bool] = {}
-        for column in ["近7天销量", "近30天销量"]:
+        for column in ["本进货周期销量", "近30天销量"]:
             values_valid = bool(group[f"_{column}有效"].all())
             unique_values = group.loc[group[f"_{column}有效"], f"_{column}"].dropna().unique()
             consistent = len(unique_values) <= 1
@@ -125,8 +127,8 @@ def build_products(
             statuses.append("单位待核对")
         if not stock_ok:
             statuses.append("库存待核对")
-        if not sales_ok["近7天销量"]:
-            statuses.append("近7天销量待核对")
+        if not sales_ok["本进货周期销量"]:
+            statuses.append("本进货周期销量待核对")
 
         barcodes = [value for value in group["_条码"].unique() if value]
         product_rows.append(
@@ -136,15 +138,25 @@ def build_products(
                 "条码": barcodes[0] if len(barcodes) == 1 else "",
                 "品类": _joined(group["品类"]),
                 "单位": "、".join(units),
+                "上次进货总量": purchase_total,
+                "库存剩余量": stock,
                 "当前库存": stock,
-                "近7天销量": sales_values["近7天销量"],
+                "本进货周期销量": sales_values["本进货周期销量"],
                 "近30天销量": sales_values["近30天销量"],
                 "货架位置": _joined(group["货架位置"]),
+                "仓库位置": _joined(group["仓库位置"]) if "仓库位置" in group.columns else "",
                 "最早到期日": pd.NaT,
                 "身份状态": "正常" if identity_ok else "待核对",
                 "库存有效": stock_ok,
-                "近7天销量有效": sales_ok["近7天销量"],
+                "本进货周期销量有效": sales_ok["本进货周期销量"],
                 "单位有效": unit_ok,
+                "库存剩余量来源": "；".join(
+                    dict.fromkeys(
+                        str(value)
+                        for value in group.get("_库存剩余量来源", pd.Series(dtype=str)).dropna()
+                        if str(value).strip()
+                    )
+                ),
                 "数据状态": "可分析" if not statuses else "；".join(statuses),
                 "_名称集合": tuple(value for value in group["_名称"].unique() if value),
                 "_源行号": tuple(int(value) for value in group["_原始行号"]),

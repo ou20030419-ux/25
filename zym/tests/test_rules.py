@@ -9,18 +9,24 @@ from src.rules import analyse
 
 def labelled_inventory(rows: list[list[object]]) -> pd.DataFrame:
     records = []
-    for name, barcode, category, _batch, stock, sales_7, sales_30, expiry, shelf, unit in rows:
+    for name, barcode, category, _batch, stock, cycle_sales, sales_30, expiry, shelf, unit in rows:
         records.append(
             {
                 "商品名": name,
                 "进货日期": "",
-                "当前库存": stock,
+                "上次进货总量": (
+                    ""
+                    if isinstance(stock, str) or isinstance(cycle_sales, str)
+                    else stock + cycle_sales
+                ),
+                "本进货周期销量": cycle_sales,
+                "库存剩余量": stock,
                 "单位": unit,
-                "近7天销量": sales_7,
                 "近30天销量": sales_30,
                 "保质期（天）": "",
                 "标注到期日期": expiry,
                 "货架位置": shelf,
+                "仓库位置": "",
                 "条码": barcode,
                 "品类": category,
             }
@@ -31,7 +37,7 @@ def labelled_inventory(rows: list[list[object]]) -> pd.DataFrame:
 class RiskRulesTests(unittest.TestCase):
     def test_sample_data_covers_core_workflow(self):
         result = analyse(template_frame("inventory", True), template_frame("plan", True), date(2026, 5, 25))
-        self.assertEqual(result.counts["快缺货"], 2)
+        self.assertEqual(result.counts["快缺货"], 3)
         self.assertEqual(result.counts["库存偏高"], 1)
         self.assertEqual(result.counts["疑似滞销"], 1)
         self.assertEqual(result.counts["临期"], 1)
@@ -47,6 +53,41 @@ class RiskRulesTests(unittest.TestCase):
         self.assertTrue(result.plan_review.empty)
         self.assertTrue(result.missed_orders.empty)
 
+    def test_purchase_cycle_sales_is_the_stock_risk_calculation_base(self):
+        inventory = labelled_inventory(
+            [["周期薯片", "cycle-001", "膨化", "A", 2, 7, "", "2026-12-01", "A1", "袋"]]
+        )
+        result = analyse(inventory, None, date(2026, 5, 25))
+        risk = result.anomalies.iloc[0]
+        self.assertEqual(risk["风险类型"], "快缺货")
+        self.assertAlmostEqual(float(risk["预计可售进货周期数"]), 2 / 7)
+        self.assertIn("本进货周期销量 7", risk["提示依据"])
+
+    def test_remaining_stock_is_calculated_from_purchase_total_and_cycle_sales(self):
+        inventory = pd.DataFrame(
+            [
+                {
+                    "商品名": "自动库存",
+                    "进货日期": "",
+                    "上次进货总量": 30,
+                    "本进货周期销量": 12,
+                    "库存剩余量": "",
+                    "单位": "袋",
+                    "近30天销量": "",
+                    "保质期（天）": "",
+                    "标注到期日期": "2026-12-01",
+                    "货架位置": "A1",
+                    "仓库位置": "后仓",
+                    "条码": "auto-01",
+                    "品类": "膨化",
+                }
+            ],
+            columns=template_frame("inventory").columns,
+        )
+        result = analyse(inventory, None, date(2026, 5, 25))
+        self.assertEqual(float(result.products.iloc[0]["库存剩余量"]), 18)
+        self.assertEqual(result.products.iloc[0]["库存剩余量来源"], "按上次进货总量-本进货周期销量计算")
+
     def test_batch_sales_conflict_blocks_stock_risk(self):
         inventory = labelled_inventory(
             [
@@ -57,7 +98,7 @@ class RiskRulesTests(unittest.TestCase):
         result = analyse(inventory, None, date(2026, 5, 25))
         self.assertEqual(result.counts["快缺货"], 0)
         self.assertIn("销量冲突", set(result.quality_issues["问题类型"]))
-        self.assertIn("近7天销量待核对", result.products.iloc[0]["数据状态"])
+        self.assertIn("本进货周期销量待核对", result.products.iloc[0]["数据状态"])
 
     def test_barcode_identity_conflict_is_not_analyzed(self):
         inventory = labelled_inventory(
@@ -94,9 +135,10 @@ class RiskRulesTests(unittest.TestCase):
                 {
                     "商品名": "鲜奶",
                     "进货日期": "2026-05-20",
-                    "当前库存": 6,
+                    "上次进货总量": 10,
+                    "本进货周期销量": 4,
+                    "库存剩余量": 6,
                     "单位": "瓶",
-                    "近7天销量": 4,
                     "近30天销量": 16,
                     "保质期（天）": 7,
                     "标注到期日期": "",

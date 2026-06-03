@@ -6,10 +6,9 @@ from html import escape
 import pandas as pd
 import streamlit as st
 
-from src.config import INVENTORY_COLUMNS, RULESET_VERSION, STORE_TIMEZONE
+from src.config import INVENTORY_COLUMNS, RULESET_VERSION, SALES_BASE_LABEL, STORE_TIMEZONE
 from src.entry import (
     DIRECT_PLAN_COLUMNS,
-    UNIT_OPTIONS,
     blank_entry_frame,
     inventory_editor_frame,
     plan_editor_frame,
@@ -17,8 +16,39 @@ from src.entry import (
     submitted_plan,
 )
 from src.export import build_export_workbook
+from src.history import (
+    PRODUCT_SHEET,
+    SUMMARY_SHEET,
+    append_history_snapshot,
+    build_history_workbook,
+    empty_history,
+    history_metrics,
+    history_product_segments,
+    read_history_workbook,
+)
 from src.io import InputReadError, read_table, template_bytes, template_frame
 from src.rules import AnalysisResult, analyse
+
+
+DIRECT_INVENTORY_ROWS = 50
+INVENTORY_EDITOR_CHUNK_SIZE = 10
+INVENTORY_EDITOR_SECTIONS = [
+    ("销量信息录入", ["商品名", "上次进货总量", "本进货周期销量", "库存剩余量", "单位", "近30天销量"]),
+    ("临期信息录入", ["商品名", "进货日期", "保质期（天）", "标注到期日期", "货架位置", "仓库位置", "品类"]),
+]
+PAGES = [
+    "首页总览",
+    "数据录入",
+    "数据质量核对",
+    "本次重点提醒",
+    "临期与过期提示",
+    "异常商品清单",
+    "进货单自查",
+    "可能漏订清单",
+    "30天历史归档",
+    "导出结果",
+    "规则说明",
+]
 
 
 st.set_page_config(
@@ -109,6 +139,44 @@ st.markdown(
     }
     .home-card strong, .priority-card strong {display:block; color:var(--app-text); margin-bottom:.36rem;}
     .home-card span, .priority-card span {color:var(--app-muted); font-size:.9rem; line-height:1.55;}
+    .workbench-panel {
+        border:1px solid var(--app-border); border-radius:16px; background:
+        linear-gradient(135deg, #ffffff 0%, #f3fbf6 100%);
+        padding:1.08rem; margin:1rem 0 1.35rem;
+        box-shadow:0 16px 36px rgba(24,35,57,.055);
+    }
+    .workbench-title {font-size:1.05rem; font-weight:760; color:var(--app-text); margin-bottom:.18rem;}
+    .workbench-copy {color:var(--app-muted); font-size:.9rem; margin-bottom:.85rem; line-height:1.55;}
+    .workflow-grid {
+        display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px;
+        margin:.8rem 0 1rem;
+    }
+    .workflow-card {
+        border:1px solid #d7e8df; border-radius:12px; background:rgba(255,255,255,.86);
+        padding:.84rem .78rem; min-height:118px;
+    }
+    .workflow-card .step {
+        display:inline-flex; align-items:center; justify-content:center;
+        width:26px; height:26px; border-radius:7px; background:var(--app-green);
+        color:#fff; font-weight:760; font-size:.82rem; margin-bottom:.54rem;
+    }
+    .workflow-card strong {display:block; color:var(--app-text); margin-bottom:.3rem;}
+    .workflow-card span {display:block; color:var(--app-muted); font-size:.86rem; line-height:1.48;}
+    .history-tip {
+        border:1px solid #cfe3f8; border-radius:10px; background:#f4f9ff;
+        color:#1d4c7d; padding:.82rem .9rem; margin:.5rem 0 1rem;
+        line-height:1.58; font-size:.92rem;
+    }
+    .history-grid {
+        display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:12px;
+        margin:1rem 0 1.2rem;
+    }
+    .history-card {
+        border:1px solid var(--app-border); border-radius:12px; background:#fff;
+        padding:.88rem .82rem;
+    }
+    .history-card span {display:block; color:var(--app-muted); font-size:.78rem; margin-bottom:.34rem;}
+    .history-card strong {display:block; color:var(--app-text); font-size:1.24rem;}
     .priority-card.urgent {border-color:#f5b7b1; background:#fff8f7;}
     .priority-card.expiry {border-color:#f4cf9e; background:#fffaf3;}
     .priority-card.review {border-color:#bbd3ed; background:#f6fbff;}
@@ -117,6 +185,11 @@ st.markdown(
     .public-warning {
         border:1px solid #ffd6a8; border-radius:8px; background:#fff8ec;
         color:#8a4a08; padding:.78rem .88rem; margin:.7rem 0 1rem; line-height:1.55;
+    }
+    .entry-step-note {
+        border:1px solid var(--app-border); border-radius:8px; background:#fff;
+        color:var(--app-muted); padding:.68rem .78rem; margin:.4rem 0 1rem;
+        font-size:.9rem; line-height:1.55;
     }
     .auth-card {max-width:460px; margin:3.5rem auto 1rem;}
     .risk-card.urgent {border-color:#f5b7b1; color:var(--risk-red);}
@@ -171,7 +244,8 @@ st.markdown(
         .app-subtitle {display:none;}
         .metric-grid {grid-template-columns:repeat(2, minmax(0, 1fr)); gap:9px;}
         .metric-grid.expiry-grid {grid-template-columns:repeat(2, minmax(0, 1fr));}
-        .home-grid, .priority-grid {grid-template-columns:1fr; gap:10px;}
+        .home-grid, .priority-grid, .workflow-grid, .history-grid {grid-template-columns:1fr; gap:10px;}
+        .workbench-panel {padding:.9rem .78rem; border-radius:12px;}
         .home-card, .priority-card {padding:.86rem .78rem;}
         .risk-card {min-height:98px; padding:.68rem .6rem;}
         .risk-name {font-size:.83rem;}
@@ -228,11 +302,63 @@ def load_uploaded(content: bytes, filename: str) -> pd.DataFrame:
     return read_table(content, filename)
 
 
+@st.cache_data(show_spinner=False)
+def cached_template_bytes(kind: str, sample: bool = False) -> bytes:
+    return template_bytes(kind, sample)
+
+
+@st.cache_data(show_spinner=False)
+def analyse_cached(
+    inventory_frame: pd.DataFrame,
+    plan_frame: pd.DataFrame | None,
+    analysis_date,
+) -> AnalysisResult:
+    plan = None if plan_frame is None else plan_frame.copy()
+    return analyse(inventory_frame.copy(), plan, analysis_date)
+
+
 def page_intro(title: str, description: str = "", badge: str = "") -> None:
     badge_html = f'<span class="source-badge">{escape(badge)}</span>' if badge else ""
     st.markdown(f"<h2>{escape(title)}{badge_html}</h2>", unsafe_allow_html=True)
     if description:
         st.markdown(f'<p class="section-lead">{escape(description)}</p>', unsafe_allow_html=True)
+
+
+def initialise_navigation() -> None:
+    page_aliases = {"今日重点提醒": "本次重点提醒"}
+    pending_page = st.session_state.get("pending_page", "")
+    pending_page = page_aliases.get(pending_page, pending_page)
+    if pending_page in PAGES:
+        st.session_state["active_page"] = pending_page
+        st.session_state["page_selector"] = pending_page
+        st.session_state["pending_page"] = ""
+    if "active_page" not in st.session_state:
+        st.session_state["active_page"] = "首页总览"
+    st.session_state["active_page"] = page_aliases.get(
+        st.session_state["active_page"], st.session_state["active_page"]
+    )
+    if st.session_state["active_page"] not in PAGES:
+        st.session_state["active_page"] = "首页总览"
+    if "page_selector" in st.session_state:
+        st.session_state["page_selector"] = page_aliases.get(
+            st.session_state["page_selector"], st.session_state["page_selector"]
+        )
+    if "page_selector" not in st.session_state or st.session_state["page_selector"] not in PAGES:
+        st.session_state["page_selector"] = st.session_state["active_page"]
+
+
+def navigate_to(page: str) -> None:
+    st.session_state["pending_page"] = page
+    st.rerun()
+
+
+def initialise_history_archive() -> None:
+    if "history_archive" not in st.session_state:
+        st.session_state["history_archive"] = empty_history()
+    if "history_upload_key" not in st.session_state:
+        st.session_state["history_upload_key"] = ""
+    if "history_saved_date" not in st.session_state:
+        st.session_state["history_saved_date"] = ""
 
 
 def shown(frame: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame:
@@ -257,6 +383,100 @@ def shown(frame: pd.DataFrame, columns: list[str] | None = None) -> pd.DataFrame
 
 def message_without_plan() -> None:
     st.info("尚未提供计划进货信息。直接填写或上传进货单后，可分析进货风险和可能漏订商品。")
+
+
+def inventory_column_config() -> dict[str, object]:
+    return {
+        "序号": st.column_config.NumberColumn("行号", help="用于对齐同一段内几张窄表，不参与分析"),
+        "商品名": st.column_config.TextColumn(help="填写商品名称，用于归并同一商品的销量和临期批次"),
+        "进货日期": st.column_config.TextColumn(help="建议格式：YYYY-MM-DD；用于无包装到期日时估算到期时间"),
+        "上次进货总量": st.column_config.TextColumn(help="填写上一次统一进货时该商品的进货总量，例如 24"),
+        "本进货周期销量": st.column_config.TextColumn(help="填写从上次进货到本次复核之间售出的数量"),
+        "库存剩余量": st.column_config.TextColumn(
+            help="可留空；系统会按“上次进货总量 - 本进货周期销量”自动计算。手动填写时优先使用手动值"
+        ),
+        "当前库存": st.column_config.TextColumn(help="旧表兼容字段；公网录入请优先使用库存剩余量"),
+        "近30天销量": st.column_config.TextColumn(help="用于趋势参考，不影响本进货周期核心判断"),
+        "保质期（天）": st.column_config.TextColumn(help="填写正整数天数，例如 7、30、180"),
+        "标注到期日期": st.column_config.TextColumn(
+            "标注到期日期（可选）", help="包装有明确到期日期时填写，优先于系统估算；建议格式：YYYY-MM-DD"
+        ),
+        "货架位置": st.column_config.TextColumn(help="例如 A-01、冷藏柜-2，便于及时下架处理"),
+        "仓库位置": st.column_config.TextColumn(help="例如 后仓-1层、冷藏仓、促销备货区"),
+        "条码": st.column_config.TextColumn(help="可留空；填写时请保留前导零"),
+        "品类": st.column_config.TextColumn(help="例如饮料、乳制品、糕点，便于筛选"),
+        "单位": st.column_config.TextColumn("单位", help="可直接填写常用单位或自定义单位，例如 袋、盒、斤、礼盒"),
+    }
+
+
+def inventory_section_frame(chunk: pd.DataFrame, start: int, columns: list[str]) -> pd.DataFrame:
+    section = chunk[columns].copy()
+    section.insert(0, "序号", list(range(start + 1, start + len(section) + 1)))
+    return section
+
+
+def merge_inventory_section(
+    chunk: pd.DataFrame, edited: pd.DataFrame, columns: list[str]
+) -> pd.DataFrame:
+    updated = chunk.copy()
+    for column in columns:
+        if column in edited.columns:
+            updated[column] = edited[column].values
+    return updated
+
+
+def row_has_entry(row: pd.Series) -> bool:
+    ignored_empty_values = {"", "请选择单位"}
+    for value in row.fillna("").astype(str):
+        if value.strip() not in ignored_empty_values:
+            return True
+    return False
+
+
+def render_segmented_inventory_editor(frame: pd.DataFrame, revision: int) -> pd.DataFrame:
+    data = inventory_editor_frame(frame)
+    progress_slot = st.empty()
+    total_rows = len(data)
+    chunk_starts = list(range(0, total_rows, INVENTORY_EDITOR_CHUNK_SIZE))
+
+    def chunk_label(start: int) -> str:
+        end = min(start + INVENTORY_EDITOR_CHUNK_SIZE, total_rows)
+        chunk = data.iloc[start:end].copy()
+        chunk_populated = int(chunk.apply(row_has_entry, axis=1).sum())
+        label = f"第 {start + 1}-{end} 行"
+        if chunk_populated:
+            label = f"{label}（已填 {chunk_populated} 行）"
+        return label
+
+    selected_start = st.selectbox(
+        "当前编辑段",
+        chunk_starts,
+        format_func=chunk_label,
+        key=f"inventory_chunk_selector_{revision}",
+    )
+    selected_end = min(selected_start + INVENTORY_EDITOR_CHUNK_SIZE, total_rows)
+    edited_chunk = data.iloc[selected_start:selected_end].copy().reset_index(drop=True)
+    tabs = st.tabs([name for name, _ in INVENTORY_EDITOR_SECTIONS])
+    for tab, (name, columns) in zip(tabs, INVENTORY_EDITOR_SECTIONS):
+        with tab:
+            edited = st.data_editor(
+                inventory_section_frame(edited_chunk, selected_start, columns),
+                key=f"inventory_editor_{revision}_{selected_start}_{name}",
+                num_rows="fixed",
+                hide_index=True,
+                width="stretch",
+                height=350,
+                column_config=inventory_column_config(),
+                disabled=["序号"],
+            )
+            edited_chunk = merge_inventory_section(edited_chunk, edited, columns)
+    data.iloc[selected_start:selected_end] = edited_chunk[data.columns].values
+    populated_count = int(data.apply(row_has_entry, axis=1).sum())
+    progress_slot.markdown(
+        f'<div class="entry-step-note">当前已填写 {populated_count} 行。</div>',
+        unsafe_allow_html=True,
+    )
+    return inventory_editor_frame(data)
 
 
 def metric_cards_html(counts: dict[str, int]) -> str:
@@ -357,34 +577,64 @@ def render_priority_cards(result: AnalysisResult) -> None:
     st.markdown(f'<div class="priority-grid">{cards}</div>', unsafe_allow_html=True)
 
 
-def render_home(result: AnalysisResult | None, analysis_source: str) -> None:
+def render_workbench(result: AnalysisResult | None, history_archive: dict[str, pd.DataFrame]) -> None:
+    metrics = history_metrics(history_archive)
+    cards = [
+        ("1", "数据录入", ""),
+        ("2", "本次重点提醒", ""),
+        ("3", "30天历史归档", f"已归档 {metrics['归档天数']} 天"),
+        ("4", "导出结果", ""),
+    ]
+    html = "".join(
+        '<div class="workflow-card">'
+        f'<div class="step">{escape(step)}</div>'
+        f"<strong>{escape(title)}</strong>"
+        f"{f'<span>{escape(body)}</span>' if body else ''}"
+        "</div>"
+        for step, title, body in cards
+    )
+    st.markdown(
+        '<div class="workbench-panel">'
+        '<div class="workbench-title">本周期工作台</div>'
+        f'<div class="workflow-grid">{html}</div>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    col1, col2, col3, col4 = st.columns(4)
+    if col1.button("开始本周期录入", type="primary", width="stretch"):
+        navigate_to("数据录入")
+    summary_disabled = result is None
+    if col2.button("查看本次重点", width="stretch", disabled=summary_disabled):
+        navigate_to("本次重点提醒")
+    if col3.button("保存/查看30天归档", width="stretch"):
+        navigate_to("30天历史归档")
+    if col4.button("导出 Excel", width="stretch", disabled=summary_disabled):
+        navigate_to("导出结果")
+
+
+def render_home(
+    result: AnalysisResult | None,
+    analysis_source: str,
+    history_archive: dict[str, pd.DataFrame],
+) -> None:
     page_intro(
         "首页总览",
-        "零食门店商品动销与批次临期管理助手，适合手机快速查看今日优先事项。",
+        "零食门店商品动销与批次临期管理助手。",
     )
     st.markdown(
         '<div class="public-warning">公网版本仅用于演示、培训或低敏数据自查；不建议上传真实门店敏感数据、'
         "客户信息、完整供应链价格或内部考核资料。</div>",
         unsafe_allow_html=True,
     )
+    render_workbench(result, history_archive)
     if result is None:
-        cards = [
-            ("录入或上传", "填写库存、销量、进货日期、保质期，也可上传整理好的表格。"),
-            ("自动提示", "识别快缺货、高库存、滞销、临期、进货风险和可能漏订。"),
-            ("导出留档", "分析完成后可导出 Excel，用于复核、沟通和归档。"),
-        ]
-        html = "".join(
-            f"<div class='home-card'><strong>{escape(title)}</strong><span>{escape(body)}</span></div>"
-            for title, body in cards
-        )
-        st.markdown(f'<div class="home-grid">{html}</div>', unsafe_allow_html=True)
-        st.info("请先进入“数据录入”填写或上传库存销售信息。")
+        st.info("暂无分析数据。")
         return
 
     if analysis_source:
         st.caption(f"当前数据来源：{analysis_source}")
     st.markdown(metric_cards_html(result.counts), unsafe_allow_html=True)
-    st.subheader("今日重点处理清单")
+    st.subheader("本次重点处理清单")
     render_priority_cards(result)
     with st.expander("展开查看详细表格"):
         st.markdown("**库存与临期异常**")
@@ -400,7 +650,7 @@ def render_home(result: AnalysisResult | None, analysis_source: str) -> None:
 
 def initialise_direct_entry() -> None:
     defaults = {
-        "direct_inventory_draft": inventory_editor_frame(blank_entry_frame(INVENTORY_COLUMNS, 50)),
+        "direct_inventory_draft": inventory_editor_frame(blank_entry_frame(INVENTORY_COLUMNS, DIRECT_INVENTORY_ROWS)),
         "direct_plan_draft": blank_entry_frame(DIRECT_PLAN_COLUMNS, 20),
         "direct_inventory_submitted": None,
         "direct_plan_submitted": None,
@@ -417,7 +667,7 @@ def initialise_direct_entry() -> None:
     st.session_state["direct_plan_draft"] = plan_editor_frame(
         st.session_state["direct_plan_draft"]
     )
-    inventory_missing_rows = 50 - len(st.session_state["direct_inventory_draft"])
+    inventory_missing_rows = DIRECT_INVENTORY_ROWS - len(st.session_state["direct_inventory_draft"])
     if inventory_missing_rows > 0:
         st.session_state["direct_inventory_draft"] = pd.concat(
             [
@@ -439,32 +689,31 @@ def initialise_direct_entry() -> None:
 
 def render_templates() -> None:
     st.subheader("模板与演示数据")
-    st.caption("批量填写可下载 Excel 模板；模板包含进货日期、保质期与可选标注到期日，条码保留为文本。")
     col1, col2, col3, col4 = st.columns(4)
     col1.download_button(
         "库存表空白模板",
-        template_bytes("inventory"),
+        cached_template_bytes("inventory"),
         "库存销售表_空白模板.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
     col2.download_button(
         "进货单空白模板",
-        template_bytes("plan"),
+        cached_template_bytes("plan"),
         "计划进货单_空白模板.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
     col3.download_button(
         "库存表演示数据",
-        template_bytes("inventory", sample=True),
+        cached_template_bytes("inventory", sample=True),
         "库存销售表_演示数据.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
     )
     col4.download_button(
         "进货单演示数据",
-        template_bytes("plan", sample=True),
+        cached_template_bytes("plan", sample=True),
         "计划进货单_演示数据.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         width="stretch",
@@ -477,9 +726,8 @@ def render_file_upload(
     result: AnalysisResult | None,
 ) -> None:
     st.subheader("上传已整理的表格")
-    st.write("适合已有库存表或一次录入商品较多的情况。")
     if result is None:
-        st.info("请先在左侧上传库存销售表。计划进货单可稍后补充。")
+        st.info("尚未上传库存销售表。")
     else:
         left, right = st.columns(2)
         with left:
@@ -495,8 +743,8 @@ def render_file_upload(
 def render_direct_entry(result: AnalysisResult | None) -> None:
     st.subheader("直接录入商品库存、销量与保质信息")
     st.markdown(
-        '<div class="entry-callout">先填商品名、进货日期、库存与销量，再填写保质期。'
-        "系统会计算临期与过期提醒；包装上已有到期日时可直接标注。</div>",
+        f'<div class="entry-callout">建议按每次统一进货作为一个周期录入：填写上次进货总量和{SALES_BASE_LABEL}后，'
+        "系统会自动计算库存剩余量；缺货、高库存和进货后库存复核都会按“还能撑几个进货周期”判断。</div>",
         unsafe_allow_html=True,
     )
     action_left, action_right, _ = st.columns([1.5, 1.25, 2.25])
@@ -511,7 +759,7 @@ def render_direct_entry(result: AnalysisResult | None) -> None:
         st.rerun()
     if action_right.button("清空", width="stretch"):
         st.session_state["direct_inventory_draft"] = inventory_editor_frame(
-            blank_entry_frame(INVENTORY_COLUMNS, 50)
+            blank_entry_frame(INVENTORY_COLUMNS, DIRECT_INVENTORY_ROWS)
         )
         st.session_state["direct_plan_draft"] = blank_entry_frame(DIRECT_PLAN_COLUMNS, 20)
         st.session_state["direct_inventory_submitted"] = None
@@ -524,42 +772,15 @@ def render_direct_entry(result: AnalysisResult | None) -> None:
     revision = st.session_state["direct_editor_revision"]
     submit_top = st.button("提交并查看提醒", type="primary", width="stretch", key="submit_entry_top")
     st.markdown("**商品清单与过期判断资料（最多 50 条）**")
-    st.caption("库存数量后一栏即可选择库存/销售单位，例如填写 `12` 后选择 `瓶`；近7天与近30天销量采用同一单位。")
-    inventory_draft = st.data_editor(
-        st.session_state["direct_inventory_draft"],
-        key=f"inventory_editor_{revision}",
-        num_rows="dynamic",
-        hide_index=True,
-        width="stretch",
-        column_config={
-            "商品名": st.column_config.TextColumn(help="可与条码任选其一填写；两者都有时优先使用条码"),
-            "进货日期": st.column_config.TextColumn(help="建议格式：YYYY-MM-DD；用于无包装到期日时估算到期时间"),
-            "当前库存": st.column_config.TextColumn(help="填写非负数量，例如 12"),
-            "近7天销量": st.column_config.TextColumn(help="填写近 7 天售出的非负数量"),
-            "近30天销量": st.column_config.TextColumn(help="填写近 30 天售出的非负数量"),
-            "保质期（天）": st.column_config.TextColumn(help="填写正整数天数，例如 7、30、180"),
-            "标注到期日期": st.column_config.TextColumn(
-                "标注到期日期（可选）", help="包装有明确到期日期时填写，优先于系统估算；建议格式：YYYY-MM-DD"
-            ),
-            "货架位置": st.column_config.TextColumn(help="例如 A-01、冷藏柜-2，便于及时下架处理"),
-            "条码": st.column_config.TextColumn(help="可留空；填写时请保留前导零"),
-            "品类": st.column_config.TextColumn(help="例如饮料、乳制品、糕点，便于筛选"),
-            "单位": st.column_config.SelectboxColumn(
-                "库存/销量单位", options=UNIT_OPTIONS, help="数量分析均使用此基础单位"
-            ),
-            "自定义单位": st.column_config.TextColumn(
-                help="选择“其他（手动填写）”时输入，例如毫升、礼盒"
-            ),
-        },
+    inventory_draft = render_segmented_inventory_editor(
+        st.session_state["direct_inventory_draft"], revision
     )
     st.session_state["direct_inventory_draft"] = inventory_draft
-    st.caption("临期计算：有标注到期日期时按标注判断；否则按 `进货日期 + 保质期（天）` 估算，并在结果中注明来源。")
 
     include_plan = st.checkbox("本次同时填写计划进货商品", key="direct_include_plan")
     plan_draft = st.session_state["direct_plan_draft"]
     if include_plan:
         st.markdown("**计划进货信息**")
-        st.caption("可按箱、提等单位进货。若与库存单位不同，请填写换算数量，例如每箱折合 24 瓶。")
         plan_draft = st.data_editor(
             st.session_state["direct_plan_draft"],
             key=f"plan_editor_{revision}",
@@ -569,9 +790,9 @@ def render_direct_entry(result: AnalysisResult | None) -> None:
             column_config={
                 "商品名": st.column_config.TextColumn(help="可与条码任选其一填写；两者都有时优先使用条码"),
                 "条码": st.column_config.TextColumn(help="有条码时按条码匹配"),
-                "进货单位": st.column_config.SelectboxColumn(options=UNIT_OPTIONS),
-                "库存单位": st.column_config.SelectboxColumn(
-                    options=UNIT_OPTIONS, help="应与上方该商品的库存/销量单位一致"
+                "进货单位": st.column_config.TextColumn(help="可直接填写箱、袋、盒、自定义单位等"),
+                "库存单位": st.column_config.TextColumn(
+                    help="应与上方该商品的库存/销量单位一致；也可直接填写自定义单位"
                 ),
                 "每进货单位折合库存单位数量": st.column_config.NumberColumn(
                     help="同一单位可填 1；例如 1 箱 = 24 瓶则填写 24",
@@ -581,7 +802,6 @@ def render_direct_entry(result: AnalysisResult | None) -> None:
         )
         st.session_state["direct_plan_draft"] = plan_draft
 
-    st.caption("单位换算提示：例如 `1箱 = 24瓶`，跨单位进货需填写折合数量。")
     submit_bottom = st.button("提交并查看提醒", type="primary", width="stretch", key="submit_entry_bottom")
     if submit_top or submit_bottom:
         inventory = submitted_inventory(inventory_draft)
@@ -593,7 +813,7 @@ def render_direct_entry(result: AnalysisResult | None) -> None:
             st.rerun()
 
     if result is not None:
-        st.success("已提交填写内容。可从左侧查看质量核对、提醒与导出结果；修改后请重新提交分析。")
+        st.success("已提交填写内容。可回到首页工作台查看提醒、保存30天归档或导出结果；修改后请重新提交分析。")
     render_templates()
 
 
@@ -628,7 +848,7 @@ def render_quality(result: AnalysisResult) -> None:
 
 def render_summary(result: AnalysisResult, analysis_source: str) -> None:
     badge = "演示数据" if analysis_source == "演示数据" else ""
-    page_intro("今日重点提醒", "根据当前规则计算，以下商品需要重点关注", badge)
+    page_intro("本次重点提醒", "根据本次录入和本进货周期销量计算，以下商品需要重点关注", badge)
     if analysis_source == "演示数据":
         st.caption("当前为演示数据，非真实结果。回到“数据录入”清空示例后可填写自己的商品。")
     else:
@@ -641,14 +861,14 @@ def render_summary(result: AnalysisResult, analysis_source: str) -> None:
     if not result.plan_uploaded:
         message_without_plan()
     st.caption(f"当前规则版本：{RULESET_VERSION}。提醒仅用于复核，不代表必须采取某一进货决定。")
-    st.subheader("今日重点处理清单")
+    st.subheader("本次重点处理清单")
     render_priority_cards(result)
     st.subheader("这些提醒来自哪些商品")
     explanation_rows: list[dict[str, str]] = []
     inventory_types = {
-        "快缺货": "预计可售天数不超过 3 天",
-        "库存偏高": "预计可售天数超过 30 天",
-        "疑似滞销": "近7天无销量但仍有库存",
+        "快缺货": f"按{SALES_BASE_LABEL}估算，预计可售不超过 1 个进货周期",
+        "库存偏高": f"按{SALES_BASE_LABEL}估算，预计可售超过 4 个进货周期",
+        "疑似滞销": f"{SALES_BASE_LABEL}为 0 且仍有库存",
         "临期": "标注到期日或按进货日期与保质期估算后，存在已到期或 30 天内到期的库存",
     }
     for label, rule_text in inventory_types.items():
@@ -729,7 +949,10 @@ def render_summary(result: AnalysisResult, analysis_source: str) -> None:
             st.write("无。")
         else:
             st.dataframe(
-                shown(result.anomalies, ["商品名", "当前库存", "单位", "近7天销量", "预计可售天数", "风险类型", "提示依据"]),
+                shown(
+                    result.anomalies,
+                    ["商品名", "上次进货总量", "库存剩余量", "单位", "本进货周期销量", "预计可售进货周期数", "风险类型", "提示依据"],
+                ),
                 width="stretch",
                 hide_index=True,
             )
@@ -740,7 +963,10 @@ def render_summary(result: AnalysisResult, analysis_source: str) -> None:
             ] if not result.plan_review.empty else pd.DataFrame()
             if not related_plan.empty:
                 st.dataframe(
-                    shown(related_plan, ["商品名", "计划进货数量", "进货后库存", "进货后预计可售天数", "风险类型", "提示依据"]),
+                    shown(
+                        related_plan,
+                        ["商品名", "计划进货数量", "进货后库存", "进货后预计可售进货周期数", "风险类型", "提示依据"],
+                    ),
                     width="stretch",
                     hide_index=True,
                 )
@@ -797,7 +1023,7 @@ def render_expiry(result: AnalysisResult) -> None:
                         "进货日期",
                         "保质期（天）",
                         "货架位置",
-                        "条码",
+                        "仓库位置",
                         "品类",
                     ],
                 ),
@@ -828,7 +1054,7 @@ def render_anomalies(result: AnalysisResult) -> None:
     pending = result.products[result.products["数据状态"] != "可分析"].copy()
     pending["风险类型"] = "待核对"
     pending["提示依据"] = pending["数据状态"]
-    pending["预计可售天数"] = pd.NA
+    pending["预计可售进货周期数"] = pd.NA
     combined = pd.concat([result.anomalies, pending], ignore_index=True)
     if combined.empty:
         st.success("未发现满足当前规则的库存异常。")
@@ -852,15 +1078,17 @@ def render_anomalies(result: AnalysisResult) -> None:
         "商品名",
         "条码",
         "品类",
-        "当前库存",
+        "上次进货总量",
+        "库存剩余量",
         "单位",
-        "近7天销量",
-        "预计可售天数",
+        "本进货周期销量",
+        "预计可售进货周期数",
         "最早到期日",
         "已到期库存",
         "7天内临期库存",
         "8至30天临期库存",
         "货架位置",
+        "仓库位置",
         "风险类型",
         "提示依据",
     ]
@@ -872,7 +1100,7 @@ def render_anomalies(result: AnalysisResult) -> None:
 
 
 def render_plan(result: AnalysisResult) -> None:
-    page_intro("进货单自查", "结合当前库存复核本次计划进货数量。")
+    page_intro("进货单自查", "结合库存剩余量复核本次计划进货数量。")
     if not result.plan_uploaded:
         message_without_plan()
         return
@@ -894,6 +1122,159 @@ def render_missed(result: AnalysisResult) -> None:
         return
     with st.expander("展开查看详细表格", expanded=True):
         st.dataframe(shown(result.missed_orders), width="stretch", hide_index=True)
+
+
+def render_history_segments(segments: pd.DataFrame) -> None:
+    st.subheader("30天商品经营分层")
+    if segments.empty:
+        st.caption("保存 2 次以上进货周期数据后，这里会开始区分稳定好卖、库存偏高和持续滞销商品。")
+        return
+
+    segment_order = ["稳定好卖", "本周期需要补货", "库存偏高", "持续滞销", "正常动销", "观察中", "数据不足"]
+    counts = segments["经营分层"].value_counts().to_dict()
+    card_html = "".join(
+        f'<div class="history-card"><span>{escape(label)}</span><strong>{escape(str(int(counts.get(label, 0))))}</strong></div>'
+        for label in segment_order
+        if counts.get(label, 0)
+    )
+    if card_html:
+        st.markdown(f'<div class="history-grid">{card_html}</div>', unsafe_allow_html=True)
+
+    focus = segments[segments["经营分层"].isin(["稳定好卖", "本周期需要补货", "库存偏高", "持续滞销"])].head(8)
+    if not focus.empty:
+        tone_map = {
+            "稳定好卖": "urgent",
+            "本周期需要补货": "urgent",
+            "库存偏高": "review",
+            "持续滞销": "review",
+        }
+        cards = "".join(
+            f'<div class="priority-card {escape(tone_map.get(row["经营分层"], ""))}">'
+            f'<div class="priority-type">{escape(row["经营分层"])}</div>'
+            f'<strong>{escape(str(row["商品名"]))}</strong>'
+            f'<span>{escape(str(row["建议动作"]))}</span>'
+            "</div>"
+            for _, row in focus.iterrows()
+        )
+        st.markdown(f'<div class="priority-grid">{cards}</div>', unsafe_allow_html=True)
+
+    with st.expander("展开查看30天商品分层明细", expanded=True):
+        st.dataframe(shown(segments), width="stretch", hide_index=True)
+
+
+def render_history(
+    result: AnalysisResult | None,
+    inventory_frame: pd.DataFrame | None,
+    plan_frame: pd.DataFrame | None,
+    analysis_date,
+    analysis_source: str,
+) -> None:
+    page_intro("30天历史归档", "按每次录入保存分析快照，用于连续查看库存、销量、进货与临期变化。")
+    st.markdown(
+        '<div class="history-tip">公网部署不会可靠保存服务器本地文件。建议每个进货周期录入并分析后点击'
+        "“保存本次到30天归档”，再下载归档 Excel；下次打开网页后先上传这个归档文件，就能接着累计。</div>",
+        unsafe_allow_html=True,
+    )
+    if st.session_state.get("history_saved_date"):
+        st.success(f"已保存 {st.session_state['history_saved_date']} 的归档记录。")
+        st.session_state["history_saved_date"] = ""
+
+    archive_upload = st.file_uploader(
+        "上传上次下载的30天归档 Excel（可选）",
+        type=["xlsx"],
+        key="history_archive_upload",
+    )
+    if archive_upload is not None:
+        archive_bytes = archive_upload.getvalue()
+        upload_key = f"{archive_upload.name}:{len(archive_bytes)}"
+        if st.session_state.get("history_upload_key") != upload_key:
+            try:
+                st.session_state["history_archive"] = read_history_workbook(
+                    archive_bytes, archive_upload.name
+                )
+                st.session_state["history_upload_key"] = upload_key
+                st.success("已载入历史归档，可继续保存本次数据。")
+            except ValueError as error:
+                st.error(str(error))
+
+    history_archive = st.session_state["history_archive"]
+    metrics = history_metrics(history_archive)
+    card_html = "".join(
+        f'<div class="history-card"><span>{escape(label)}</span><strong>{escape(str(value))}</strong></div>'
+        for label, value in metrics.items()
+    )
+    st.markdown(f'<div class="history-grid">{card_html}</div>', unsafe_allow_html=True)
+
+    save_disabled = result is None or inventory_frame is None
+    action_left, action_middle, action_right = st.columns([1.4, 1.4, 1.2])
+    if action_left.button(
+        "保存本次到30天归档",
+        type="primary",
+        width="stretch",
+        disabled=save_disabled,
+    ):
+        st.session_state["history_archive"] = append_history_snapshot(
+            history_archive,
+            result,
+            inventory_frame,
+            plan_frame,
+            analysis_date,
+            analysis_source or "本次录入",
+        )
+        st.session_state["history_saved_date"] = analysis_date.isoformat()
+        st.rerun()
+    if save_disabled:
+        st.info("请先完成“数据录入”并提交分析，再保存本次归档。")
+
+    export_bytes = build_history_workbook(
+        st.session_state["history_archive"], datetime.now(STORE_TIMEZONE)
+    )
+    action_middle.download_button(
+        "下载30天归档 Excel",
+        export_bytes,
+        f"30天经营归档_{datetime.now(STORE_TIMEZONE).date().isoformat()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        width="stretch",
+    )
+    if action_right.button("清空页面内归档", width="stretch"):
+        st.session_state["history_archive"] = empty_history()
+        st.session_state["history_upload_key"] = ""
+        st.rerun()
+
+    history_archive = st.session_state["history_archive"]
+    summary = history_archive.get(SUMMARY_SHEET, pd.DataFrame())
+    products = history_archive.get(PRODUCT_SHEET, pd.DataFrame())
+    segments = history_product_segments(history_archive)
+
+    if summary.empty and products.empty:
+        st.caption("当前还没有历史归档。保存本次分析后，这里会显示每次汇总和商品趋势。")
+        return
+
+    render_history_segments(segments)
+
+    if not summary.empty:
+        with st.expander("展开查看30天每次汇总", expanded=True):
+            st.dataframe(shown(summary), width="stretch", hide_index=True)
+            chart_columns = ["快缺货", "库存偏高", "疑似滞销", "临期", "进货风险", "可能漏订"]
+            chart = summary[["归档日期", *chart_columns]].copy()
+            for column in chart_columns:
+                chart[column] = pd.to_numeric(chart[column], errors="coerce").fillna(0)
+            st.line_chart(chart.set_index("归档日期"))
+
+    if not products.empty:
+        product_names = sorted(
+            name for name in products["商品名"].dropna().astype(str).unique() if name
+        )
+        if product_names:
+            selected_product = st.selectbox("查看单个商品30天趋势", product_names)
+            trend = products[products["商品名"].astype(str) == selected_product].copy()
+            trend = trend.sort_values("归档日期")
+            numeric_columns = ["上次进货总量", "库存剩余量", "本进货周期销量", "近30天销量", "预计可售进货周期数"]
+            for column in numeric_columns:
+                trend[column] = pd.to_numeric(trend[column], errors="coerce")
+            st.line_chart(trend[["归档日期", *numeric_columns]].set_index("归档日期"))
+        with st.expander("展开查看商品归档明细"):
+            st.dataframe(shown(products), width="stretch", hide_index=True)
 
 
 def render_export(
@@ -923,14 +1304,16 @@ def render_rules(analysis_date) -> None:
     st.write(f"规则版本：`{RULESET_VERSION}`　|　分析日期：`{analysis_date.isoformat()}`")
     rule_table = pd.DataFrame(
         [
-            ["快缺货", "近7天销量 > 0，预计可售天数 <= 3 天"],
-            ["库存偏高", "近7天销量 > 0，预计可售天数 > 30 天"],
-            ["疑似滞销", "近7天销量 = 0 且当前库存 > 0"],
+            ["快缺货", f"{SALES_BASE_LABEL} > 0，预计可售进货周期数 <= 1"],
+            ["库存偏高", f"{SALES_BASE_LABEL} > 0，预计可售进货周期数 > 4"],
+            ["疑似滞销", f"{SALES_BASE_LABEL} = 0 且库存剩余量 > 0"],
+            ["库存剩余量", "优先使用手动填写的库存剩余量；未填写时按上次进货总量 - 本进货周期销量自动计算"],
+            ["销量计算基准", f"按一次统一进货作为一个周期；库存风险、进货后库存和漏订判断均按{SALES_BASE_LABEL}计算"],
             ["到期日计算", "优先采用标注到期日期；未填写时按进货日期 + 保质期（天）估算"],
             ["已到期", "计算得到的到期日期 <= 分析日期，且该批库存仍有库存"],
             ["7天内临期", "计算得到的到期日期在分析日期后 1 至 7 天，且仍有库存"],
             ["8至30天临期", "计算得到的到期日期在分析日期后 8 至 30 天，且仍有库存"],
-            ["可能进货过量", "进货后预计可售天数 > 45 天"],
+            ["可能进货过量", "进货后预计可售进货周期数 > 6"],
             ["可能漏订", "符合快缺货，且未匹配到正数计划进货数量"],
         ],
         columns=["提示类型", "判断依据"],
@@ -950,7 +1333,9 @@ def render_rules(analysis_date) -> None:
 
 
 require_password()
+initialise_navigation()
 initialise_direct_entry()
+initialise_history_archive()
 st.markdown(
     '<div class="mobile-brand"><span class="brand-mark">✓</span>零食门店商品动销与批次临期管理助手</div>',
     unsafe_allow_html=True,
@@ -962,22 +1347,14 @@ with st.sidebar:
         "<span>零食门店商品动销<br>与批次临期管理助手</span></div>",
         unsafe_allow_html=True,
     )
-    page = st.radio(
+    st.radio(
         "功能导航",
-        [
-            "首页总览",
-            "数据录入",
-            "数据质量核对",
-            "今日重点提醒",
-            "临期与过期提示",
-            "异常商品清单",
-            "进货单自查",
-            "可能漏订清单",
-            "导出结果",
-            "规则说明",
-        ],
+        PAGES,
         label_visibility="collapsed",
+        key="page_selector",
     )
+    st.session_state["active_page"] = st.session_state["page_selector"]
+    page = st.session_state["active_page"]
     st.divider()
     st.subheader("本次自查")
     today = datetime.now(STORE_TIMEZONE).date()
@@ -988,8 +1365,6 @@ with st.sidebar:
     if input_mode == "上传表格":
         inventory_upload = st.file_uploader("库存销售表", type=["xlsx", "csv"])
         plan_upload = st.file_uploader("计划进货单（可选）", type=["xlsx", "csv"])
-    else:
-        st.caption("请在“数据录入”步骤直接填写商品情况。")
     st.markdown(
         f'<div class="sidebar-note"><strong>ⓘ 结果说明</strong>'
         f"规则版本：{RULESET_VERSION}<br>本地分析，不含考核与排名</div>",
@@ -997,6 +1372,8 @@ with st.sidebar:
     )
 
 result: AnalysisResult | None = None
+inventory_frame: pd.DataFrame | None = None
+plan_frame: pd.DataFrame | None = None
 inventory_name: str | None = None
 plan_name: str | None = None
 analysis_source = ""
@@ -1006,7 +1383,8 @@ if input_mode == "直接填写" and st.session_state["direct_inventory_submitted
     inventory_name = "页面直接填写_库存销售"
     plan_name = "页面直接填写_计划进货" if plan_frame is not None else None
     analysis_source = st.session_state["direct_data_origin"]
-    result = analyse(inventory_frame, plan_frame, analysis_date)
+    with st.spinner("正在分析数据，请稍候..."):
+        result = analyse_cached(inventory_frame, plan_frame, analysis_date)
 elif input_mode == "上传表格" and inventory_upload is not None:
     try:
         inventory_frame = load_uploaded(inventory_upload.getvalue(), inventory_upload.name)
@@ -1015,7 +1393,8 @@ elif input_mode == "上传表格" and inventory_upload is not None:
             if plan_upload is not None
             else None
         )
-        result = analyse(inventory_frame, plan_frame, analysis_date)
+        with st.spinner("正在分析数据，请稍候..."):
+            result = analyse_cached(inventory_frame, plan_frame, analysis_date)
         inventory_name = inventory_upload.name
         plan_name = plan_upload.name if plan_upload else None
         analysis_source = f"上传文件：{inventory_upload.name}"
@@ -1023,16 +1402,18 @@ elif input_mode == "上传表格" and inventory_upload is not None:
         st.error(str(error))
 
 if page == "首页总览":
-    render_home(result, analysis_source)
+    render_home(result, analysis_source, st.session_state["history_archive"])
 elif page == "数据录入":
     render_entry(input_mode, inventory_upload, plan_upload, result)
 elif page == "规则说明":
     render_rules(analysis_date)
+elif page == "30天历史归档":
+    render_history(result, inventory_frame, plan_frame, analysis_date, analysis_source)
 elif result is None:
     st.info("请先在“数据录入”步骤直接填写或上传库存销售信息，再查看分析结果。")
 elif page == "数据质量核对":
     render_quality(result)
-elif page == "今日重点提醒":
+elif page == "本次重点提醒":
     render_summary(result, analysis_source)
 elif page == "临期与过期提示":
     render_expiry(result)
